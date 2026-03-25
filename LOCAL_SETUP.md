@@ -76,41 +76,6 @@ The production environment is hosted on **Edge Production (EC2)** and managed vi
   ```
 
 ---
-
-## 🐳 Docker Installation Guide
-
-### For Mac
-
-1. Go to: [https://www.docker.com/products/docker-desktop/](https://www.docker.com/products/docker-desktop/)
-2. Click **Download for Mac** (Apple Silicon / Intel)
-3. Open the `.dmg` file
-4. Drag Docker to the **Applications** folder
-5. Launch Docker Desktop from Applications
-6. Accept the terms & complete setup
-7. Verify installation:
-   ```bash
-   docker --version
-   ```
-
-### For Windows
-
-1. Go to: [https://www.docker.com/products/docker-desktop/](https://www.docker.com/products/docker-desktop/)
-2. Click **Download for Windows**
-3. Run the installer (`.exe`)
-4. Enable WSL 2 when prompted
-5. Restart your PC
-6. Launch Docker Desktop
-7. Verify installation:
-   ```bash
-   docker --version
-   ```
-
-### References
-
-- [Docker Official Website](https://www.docker.com)
-- [Docker Desktop Windows Installation Guide](https://docs.docker.com/desktop/setup/install/windows-install/)
-- [Docker Desktop Mac Installation Guide](https://docs.docker.com/desktop/setup/install/mac-install/)
-
 ---
 
 ## 📞 Support
