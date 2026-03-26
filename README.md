@@ -96,3 +96,28 @@ If `GOOGLE_API_KEY` is missing, the suite is configured to skip.
 - `ann` is not supported in Phase 1 and returns HTTP 400.
 - `excludevectors=true` can be sent to `/retrieve` to omit `embedding_vector` from the response.
 
+## Project Objective
+
+This project aims to build a vector database system where data is converted into embeddings and stored efficiently for similarity search.
+
+## What We Are Trying to Achieve
+
+- Convert raw data into chunks
+- Generate embeddings for each chunk
+- Store embeddings as vectors
+- Separate metadata and store it in MySQL
+- Enable efficient search using vector similarity
+
+## Features
+
+- Chunking of data
+- Embedding generation
+- Vector storage
+- Metadata storage in MySQL
+- Fast retrieval system
+
+## My Contribution
+
+- Updated README documentation
+- Understood project workflow
+- Tested project setup
