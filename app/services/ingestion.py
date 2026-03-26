@@ -7,9 +7,10 @@ import numpy as np
 
 from app.config import get_config
 from app.models import IngestResponse, StrategyResult
+from pathlib import Path
 from app.services.chunking.registry import get_chunker_registry
 from app.services.embedding.embedder import GeminiEmbedder
-from app.services.pdf_extractor import extract_pdf_pages
+from app.services.pdf_extractor import extract_pdf_pages, ExtractedPage
 from app.services.store.duplicate_checker import find_duplicate_rows
 from app.services.store.jsonl_store import JSONLStore
 from app.utils import now_ist, now_ist_iso, slugify_name
@@ -40,7 +41,7 @@ def _chunk_page_text(chunker, page_number: int, text: str) -> list[tuple[int, st
     return [(page_number, chunk) for chunk in chunks]
 
 
-def ingest_pdf(
+def ingest_file(
     file_name: str,
     file_path: str,
     kb_name: str | None,
@@ -96,6 +97,54 @@ def ingest_pdf(
         store.update_rows(resolved_kb_name, existing_rows)
         existing_rows = store.read_rows(resolved_kb_name)
 
+    ext = Path(file_path).suffix.lower()
+    is_media = ext in (".png", ".jpg", ".jpeg", ".mp4", ".mov", ".mp3", ".wav", ".m4a")
+
+    embedder = GeminiEmbedder(embedding_model or config.embedding_model)
+    created_at = now_ist_iso()
+
+    if is_media:
+        # ── Native multimodal embedding: one vector per file ──────────
+        logger.info("Generating native multimodal embedding for %s", file_name)
+        vector = embedder.embed_file(file_path)
+        strategy_name = strategy_names[0]  # use first strategy label
+        row = {
+            "chunk_id": str(uuid.uuid4()),
+            "kb_name": resolved_kb_name,
+            "source_filename": file_name,
+            "chunking_strategy": strategy_name,
+            "chunk_index": 0,
+            "page_number": None,
+            "chunk_text": f"[media:{file_name}]",
+            "embedding_model": embedder.model,
+            "embedding_vector": vector,
+            "normalised_vector": _normalise_vector(vector),
+            "vector_size": config.vector_size,
+            "chunk_size_used": None,
+            "overlap_size_used": None,
+            "is_active": True,
+            "created_at": created_at,
+            "deactivated_at": None,
+            "file_type": ext.lstrip("."),
+        }
+        store.write_rows(resolved_kb_name, [row])
+        logger.info("Wrote 1 media row to kb_name=%s", resolved_kb_name)
+        return IngestResponse(
+            kb_name=resolved_kb_name,
+            source_filename=file_name,
+            strategies_processed=[
+                StrategyResult(
+                    strategy_name=strategy_name,
+                    chunk_count=1,
+                    embedding_model=embedder.model,
+                    vector_size=config.vector_size,
+                    overwritten=overwrite and bool(active_duplicates_by_strategy.get(strategy_name)),
+                )
+            ],
+            ingested_at=created_at,
+        )
+
+    # ── PDF / text path: extract → chunk → embed text ─────────────────
     pages = extract_pdf_pages(file_path)
     if not pages:
         raise LookupError("NO_EXTRACTABLE_TEXT")
@@ -107,8 +156,6 @@ def ingest_pdf(
         raise ValueError("overlap_size must be smaller than chunk_size")
 
     chunkers = get_chunker_registry(effective_chunk_size, effective_overlap_size)
-    embedder = GeminiEmbedder(embedding_model or config.embedding_model)
-    created_at = now_ist_iso()
 
     strategies_processed: list[StrategyResult] = []
     new_rows: list[dict] = []

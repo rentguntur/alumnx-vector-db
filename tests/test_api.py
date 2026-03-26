@@ -122,6 +122,7 @@ def test_ingest_creates_vector_store_and_retrieve_groups_results(client):
     assert ingest.status_code == 200
     payload = ingest.json()
     assert payload["kb_name"] == "finance_kb"
+    assert client.vector_store_path.exists()
 
     retrieve = client.post("/retrieve", json={"query": "alpha", "kb_name": "finance_kb"})
     assert retrieve.status_code == 200

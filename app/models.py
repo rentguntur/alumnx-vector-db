@@ -78,7 +78,7 @@ class ErrorResponse(BaseModel):
 
 class DocumentResponse(BaseModel):
     id: str = Field(..., description="Unique UUID for this document record.")
-    file_hash: str = Field(..., description="SHA-256 hash of the physical PDF file to prevent exact duplicates.")
+    file_hash: str = Field(..., description="SHA-256 hash of the physical file to prevent exact duplicates.")
     original_filename: str = Field(..., description="The original filename of the document as uploaded.")
     title: str = Field(..., description="Human readable title for the document. Defaults to original_filename if empty.")
     description: Optional[str] = Field(None, description="Optional notes or context about the document.")
