@@ -19,13 +19,7 @@ COPY pyproject.toml uv.lock ./
 # Install dependencies into a portable directory
 RUN uv sync --frozen
 
-# Stage 2: Runtime stage
-FROM python:3.12-slim
-
-WORKDIR /app
-
-# Copy the synced environment from the builder
-COPY --from=builder /app/.venv /app/.venv
+# Copy the application code
 COPY . .
 
 # PATH setup to use the venv
@@ -37,5 +31,8 @@ RUN python -m nltk.downloader punkt punkt_tab
 # Expose port (can be overridden by docker-compose)
 EXPOSE 8000
 
-# Run the app
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Command to run the application
+CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

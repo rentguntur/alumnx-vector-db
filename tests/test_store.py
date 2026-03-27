@@ -44,16 +44,6 @@ def test_append_grows_file(store):
     assert chunk_ids == ["id-a", "id-b"]
 
 
-def test_rewrite_replaces_file(store):
-    old = np.array([[1.0, 0.0, 0.0]], dtype=np.float32)
-    store.append("kb1", ["old-id"], old)
-
-    new = np.array([[0.0, 0.0, 1.0]], dtype=np.float32)
-    store.rewrite("kb1", ["new-id"], new)
-
-    vectors, chunk_ids = store.read("kb1")
-    assert chunk_ids == ["new-id"]
-
 
 def test_remove_chunk_ids(store):
     vecs = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)

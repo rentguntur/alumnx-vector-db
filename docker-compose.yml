@@ -3,7 +3,7 @@ services:
     build: .
     container_name: ${CONTAINER_NAME:-alumnx-vector-db}
     ports:
-      - "${HOST_PORT:-8001}:8000"
+      - "8000:8000"
     volumes:
       - ./vector_store:/app/vector_store
     env_file:

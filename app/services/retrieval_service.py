@@ -1,175 +1,153 @@
 from __future__ import annotations
 
 import logging
-from collections import defaultdict
 
 import numpy as np
 
 from app.config import get_config
-from app.models import KBResult, ChunkResult, RetrieveRequest, RetrieveResponse, RetrievalStrategy, StrategyGroupResult
+from app.models import CandidateResult, RetrieveRequest, RetrieveResponse
 from app.services.embedding.embedder import GeminiEmbedder
-from app.services.retrieval.registry import get_retriever_registry
+from app.services.ingestion import EMBEDDABLE_SECTIONS, UNIVERSAL_VECTOR_STORE
+from app.services.llm_query import generate_sql_query
 from app.services.store.postgres_store import PostgresStore
 from app.services.store.vector_file_store import VectorFileStore
-from app.services.ingestion import UNIVERSAL_VECTOR_STORE
-from app.utils import slugify_name
 
-
-SUPPORTED_ALGORITHMS = {"knn"}
-SUPPORTED_DISTANCE_METRICS = {"cosine", "dot_product"}
 logger = logging.getLogger("nexvec.retrieval")
 
 
-def _default_retrieval_strategy() -> RetrievalStrategy:
-    config = get_config()
-    return RetrievalStrategy(
-        algorithm=config.default_retrieval_strategy.get("algorithm", "knn"),
-        distance_metric=config.default_retrieval_strategy.get("distance_metric", "cosine"),
-    )
-
-
-def _validate_retrieval_strategy(strategy: RetrievalStrategy) -> RetrievalStrategy:
-    if strategy.algorithm == "ann":
-        raise ValueError("WARNING: Retrieval algorithm 'ann' is not supported in Phase 1.")
-    if strategy.algorithm not in SUPPORTED_ALGORITHMS:
-        raise ValueError(f"Unsupported retrieval algorithm: {strategy.algorithm}")
-    if strategy.distance_metric not in SUPPORTED_DISTANCE_METRICS:
-        raise ValueError(f"Unsupported distance metric: {strategy.distance_metric}")
-    return strategy
-
-
-def _normalize(vector: list[float]) -> list[float]:
-    array = np.asarray(vector, dtype=float)
-    norm = np.linalg.norm(array)
-    if norm == 0:
-        return [0.0 for _ in vector]
-    return (array / norm).astype(float).tolist()
-
-
-def _retrieve_for_kb(
-    kb_name: str,
-    query: str,
-    k: int,
-    strategy: RetrievalStrategy,
-    embedding_model: str | None,
-    pg: PostgresStore,
-    vfs: VectorFileStore,
-) -> list[StrategyGroupResult]:
-    # Load all active chunk_id → (chunking_strategy, embedding_model) from PostgreSQL
-    group_index = pg.get_active_group_index(kb_name, embedding_model)
-    if not group_index:
-        logger.info("No active chunks found in kb_name=%s", kb_name)
-        return []
-
-    # Load vectors from the universal flat file
-    all_vectors, all_chunk_ids = vfs.read(UNIVERSAL_VECTOR_STORE)
-    if len(all_chunk_ids) == 0:
-        return []
-
-    chunk_id_to_pos = {cid: i for i, cid in enumerate(all_chunk_ids)}
-
-    # Group active chunks by (chunking_strategy, embedding_model)
-    groups: dict[tuple[str, str], list[tuple[str, int]]] = defaultdict(list)
-    for entry in group_index:
-        cid = entry["chunk_id"]
-        if cid in chunk_id_to_pos:
-            key = (entry["chunking_strategy"], entry["embedding_model"])
-            groups[key].append((cid, chunk_id_to_pos[cid]))
-
-    results: list[StrategyGroupResult] = []
-    for (chunking_strategy, model), id_pos_pairs in sorted(groups.items()):
-        group_ids = [cid for cid, _ in id_pos_pairs]
-        positions = [pos for _, pos in id_pos_pairs]
-        group_vectors = all_vectors[positions]
-
-        embedder = GeminiEmbedder(model)
-        logger.info(
-            "Retrieving group chunking_strategy=%s model=%s row_count=%s k=%s metric=%s",
-            chunking_strategy, model, len(group_ids), k, strategy.distance_metric,
-        )
-        query_vector = np.asarray(embedder.embed_query(query), dtype=np.float32)
-        if strategy.distance_metric == "cosine":
-            norm = np.linalg.norm(query_vector)
-            if norm > 0:
-                query_vector = query_vector / norm
-
-        # Pass numpy matrix directly — no Python list round-trip
-        retriever = get_retriever_registry()["knn"]
-        top_results = retriever.retrieve(
-            query_vector=query_vector,
-            vectors=group_vectors,
-            chunk_ids=group_ids,
-            k=k,
-            distance_metric=strategy.distance_metric,
-        )
-        top_chunk_ids = [cid for cid, _ in top_results]
-        similarity_by_id = {cid: score for cid, score in top_results}
-
-        # O(1) vector lookup by chunk_id — no list.index() scan
-        id_to_pos = {cid: i for i, cid in enumerate(group_ids)}
-
-        # Fetch full metadata for top-k from PostgreSQL
-        metadata_rows = pg.get_chunks_by_ids(top_chunk_ids)
-        meta_by_id = {r["chunk_id"]: r for r in metadata_rows}
-
-        chunks = [
-            ChunkResult(
-                chunk_id=cid,
-                similarity_score=similarity_by_id[cid],
-                chunk_text=meta_by_id[cid]["chunk_text"],
-                embedding_vector=group_vectors[id_to_pos[cid]].tolist(),
-                source_filename=meta_by_id[cid]["source_filename"],
-                chunk_index=meta_by_id[cid]["chunk_index"],
-                page_number=meta_by_id[cid].get("page_number"),
-                created_at=str(meta_by_id[cid]["created_at"]),
-            )
-            for cid in top_chunk_ids
-            if cid in meta_by_id
-        ]
-
-        results.append(StrategyGroupResult(
-            chunking_strategy=chunking_strategy,
-            embedding_model=model,
-            chunks=chunks,
-        ))
-
-    return results
-
-
 def retrieve_documents(request: RetrieveRequest) -> RetrieveResponse:
+    """
+    SQL-first semantic search over resumes.
+
+    Flow:
+      1. LLM converts query → SQL → Postgres returns matching resume_ids (structured filter)
+      2. Fetch chunk_ids for those resumes from the resumes table (no extra lookup needed)
+      3. Embed query → cosine similarity ONLY against the filtered resumes' vectors
+      4. Deduplicate by user_id — one result per person, best-matching resume wins
+      5. Return ranked candidates
+    """
     config = get_config()
-    strategy = request.retrieval_strategy or _default_retrieval_strategy()
-    strategy = _validate_retrieval_strategy(strategy)
     k = request.k or config.knn_k
     pg = PostgresStore()
     vfs = VectorFileStore()
-    pg.ensure_table()
-
-    logger.info("Retrieve pipeline started query=%r kb_name=%s k=%s embedding_model=%s", request.query, request.kb_name, k, request.embedding_model)
 
     if not request.query.strip():
         raise ValueError("EMPTY_QUERY")
 
-    if request.kb_name:
-        resolved = slugify_name(request.kb_name)
-        if not pg.kb_exists(resolved):
-            raise FileNotFoundError(resolved)
-        kb_names = [resolved]
+    embedding_model = request.embedding_model or config.embedding_model
+    logger.info("Retrieve: query=%r k=%s model=%s", request.query, k, embedding_model)
+
+    # ── Step 1: SQL filter → resume_ids ───────────────────────────────
+    sql_failed = False
+    try:
+        sql = generate_sql_query(request.query)
+        resume_ids = pg.execute_sql_query(sql)
+    except Exception as exc:
+        logger.warning("SQL generation/execution failed (%s), falling back to all resumes", exc)
+        resume_ids = []
+        sql_failed = True
+
+    if resume_ids:
+        resume_rows = pg.get_resumes_by_ids(resume_ids)
+    elif sql_failed:
+        # SQL errored out — fall back to full scan as a safety net
+        resume_rows = pg.get_all_active_resumes()
     else:
-        kb_names = pg.list_kb_names()
-        if not kb_names:
-            logger.info("No knowledge bases found")
-            return RetrieveResponse(query=request.query, retrieval_strategy_used=strategy, k_used=k, results=[])
+        # SQL ran fine but matched nothing — no candidates meet the criteria
+        logger.info("SQL filter returned no matches for query=%r", request.query)
+        return RetrieveResponse(query=request.query, k_used=k, candidates=[])
 
-    kb_results: list[KBResult] = []
-    for kb_name in kb_names:
-        strategy_results = _retrieve_for_kb(kb_name, request.query, k, strategy, request.embedding_model, pg, vfs)
-        kb_results.append(KBResult(kb_name=kb_name, strategy_results=strategy_results))
+    if not resume_rows:
+        logger.info("No active resumes found")
+        return RetrieveResponse(query=request.query, k_used=k, candidates=[])
 
-    logger.info("Retrieve pipeline completed kb_count=%s", len(kb_results))
-    return RetrieveResponse(
-        query=request.query,
-        retrieval_strategy_used=strategy,
-        k_used=k,
-        results=kb_results,
+    # ── Step 2: Build chunk_id → resume/section mapping ──────────────
+    chunk_to_resume: dict[str, str] = {}
+    chunk_to_section: dict[str, str] = {}
+
+    for row in resume_rows:
+        for section in EMBEDDABLE_SECTIONS:
+            cid = row.get(f"{section}_chunk_id")
+            if cid:
+                chunk_to_resume[cid] = row["resume_id"]
+                chunk_to_section[cid] = section
+
+    # ── Step 3: Embed query (unit-normalised) ─────────────────────────
+    embedder = GeminiEmbedder(embedding_model)
+    query_vector = np.asarray(embedder.embed_query(request.query), dtype=np.float32)
+    norm = np.linalg.norm(query_vector)
+    if norm > 0:
+        query_vector = query_vector / norm
+
+    # ── Step 4: Targeted vector search on flat store ──────────────────
+    # Load the single flat file once, filter to SQL-filtered chunks only.
+    # Dot product = cosine similarity since all vectors are unit-normalised.
+    all_vectors, all_ids = vfs.read(UNIVERSAL_VECTOR_STORE)
+    score_by_chunk: dict[str, float] = {}
+
+    if len(all_ids) > 0:
+        id_to_pos = {cid: i for i, cid in enumerate(all_ids)}
+        target_chunks = [cid for cid in chunk_to_resume if cid in id_to_pos]
+
+        if target_chunks:
+            positions = [id_to_pos[cid] for cid in target_chunks]
+            subset = all_vectors[positions]
+            scores = (subset @ query_vector).tolist()
+            for cid, score in zip(target_chunks, scores):
+                score_by_chunk[cid] = float(score)
+
+    if not score_by_chunk:
+        return RetrieveResponse(query=request.query, k_used=k, candidates=[])
+
+    # ── Step 5: Best score + matched sections per resume ──────────────
+    best_score: dict[str, float] = {}
+    matched_sections: dict[str, list[str]] = {}
+
+    for cid, score in score_by_chunk.items():
+        rid = chunk_to_resume[cid]
+        section = chunk_to_section[cid]
+        if rid not in best_score or score > best_score[rid]:
+            best_score[rid] = score
+        matched_sections.setdefault(rid, [])
+        if section not in matched_sections[rid]:
+            matched_sections[rid].append(section)
+
+    ranked_ids = sorted(best_score, key=lambda r: best_score[r], reverse=True)
+
+    # ── Step 6: Deduplicate by user_id ────────────────────────────────
+    resume_rows_by_id = {r["resume_id"]: r for r in resume_rows}
+    seen_users: set[str] = set()
+    deduped_ids: list[str] = []
+
+    for rid in ranked_ids:
+        uid = resume_rows_by_id.get(rid, {}).get("user_id") or rid
+        if uid not in seen_users:
+            seen_users.add(uid)
+            deduped_ids.append(rid)
+        if len(deduped_ids) == k:
+            break
+
+    # ── Step 7: Build response ────────────────────────────────────────
+    candidates: list[CandidateResult] = []
+    for rid in deduped_ids:
+        row = resume_rows_by_id.get(rid, {})
+        candidates.append(CandidateResult(
+            user_id=row.get("user_id", rid),
+            resume_id=rid,
+            source_filename=row.get("source_filename", ""),
+            similarity_score=round(best_score[rid], 6),
+            name=row.get("name"),
+            email=row.get("email"),
+            phone=row.get("phone"),
+            location=row.get("location"),
+            work_experience_years=row.get("work_experience_years"),
+            skills=list(row.get("skills") or []),
+            objectives=row.get("objectives"),
+            matched_sections=matched_sections.get(rid, []),
+        ))
+
+    logger.info(
+        "Retrieve complete: %d unique candidates from %d resumes",
+        len(candidates), len(resume_rows),
     )
+    return RetrieveResponse(query=request.query, k_used=k, candidates=candidates)

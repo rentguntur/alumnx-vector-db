@@ -10,12 +10,7 @@ import yaml
 
 @dataclass(frozen=True)
 class AppConfig:
-    chunk_size: int
-    overlap_size: int
-    default_chunking_strategy: str
-    max_paragraph_size: int
     knn_k: int
-    default_retrieval_strategy: dict[str, str]
     embedding_model: str
     output_dimensionality: int
     vector_size: int
@@ -52,12 +47,7 @@ def get_config() -> AppConfig:
         raise RuntimeError("POSTGRES_URL environment variable is not set")
 
     _CONFIG_CACHE = AppConfig(
-        chunk_size=int(raw["chunk_size"]),
-        overlap_size=int(raw["overlap_size"]),
-        default_chunking_strategy=str(raw["default_chunking_strategy"]),
-        max_paragraph_size=int(raw["max_paragraph_size"]),
         knn_k=int(raw["knn_k"]),
-        default_retrieval_strategy=dict(raw["default_retrieval_strategy"]),
         embedding_model=str(raw["embedding_model"]),
         output_dimensionality=int(raw["output_dimensionality"]),
         vector_size=int(raw["vector_size"]),
@@ -66,4 +56,3 @@ def get_config() -> AppConfig:
         postgres_url=postgres_url,
     )
     return _CONFIG_CACHE
-

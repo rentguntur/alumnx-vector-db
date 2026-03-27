@@ -1,4 +1,5 @@
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -6,29 +7,38 @@ from fastapi.responses import JSONResponse
 
 from dotenv import load_dotenv
 
-from app.routers.chunking import router as chunking_router
 from app.routers.documents import router as documents_router
-from app.routers.knowledgebases import router as knowledgebases_router
 from app.routers.ingest import router as ingest_router
 from app.routers.retrieve import router as retrieve_router
-from app.routers.strategies import router as strategies_router
-from app.routers.documents import router as documents_router
 from app.errors import error_response
+from app.services.store.postgres_store import PostgresStore
 
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
 
-app = FastAPI(title="Alumnx Vector DB", version="1.3.0")
+logger = logging.getLogger("nexvec.main")
 
-app.include_router(chunking_router)
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    logger.info("Running DB migrations...")
+    PostgresStore().ensure_table()
+    logger.info("DB ready.")
+    yield
+
+
+app = FastAPI(title="NexVec", version="1.3.0", lifespan=lifespan)
+
 app.include_router(documents_router)
-app.include_router(knowledgebases_router)
 app.include_router(ingest_router)
 app.include_router(retrieve_router)
-app.include_router(strategies_router)
-app.include_router(documents_router)
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 
 @app.get("/")

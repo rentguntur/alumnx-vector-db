@@ -21,41 +21,63 @@ uv run pytest tests/test_api.py -q
 docker-compose up --build
 ```
 
-**Required environment variable:** `GOOGLE_API_KEY` in a `.env` file at the project root.
+**Required environment variables** — copy `.env.example` to `.env` and fill in:
+
+- `GOOGLE_API_KEY` — Google Gemini API key
+- `POSTGRES_URL` — PostgreSQL connection URL (AWS RDS or local)
 
 ## Architecture
 
-NexVec is a FastAPI-based RAG (Retrieval-Augmented Generation) service for PDF ingestion and semantic retrieval using Google Gemini embeddings.
+NexVec is a FastAPI-based recruitment RAG service: ingest PDF resumes → structured parse → embed → store; retrieve via SQL-first + targeted vector search.
 
 ### Core Pipelines
 
-**Ingest (`POST /ingest`):** PDF upload → text extraction (pdfplumber) → chunking → Gemini embedding → normalise vectors → persist to JSONL store.
+**Ingest (`POST /ingest`):**
+PDF upload → SHA-256 dedup → pdfplumber text extract → Gemini LLM parse into 7 sections → resolve/create user (email/phone identity) → embed 6 sections (unit-normalised) → append to flat `nex_vec.npy` → persist resume row to Postgres.
 
-**Retrieve (`POST /retrieve`):** Query text → Gemini embedding → load JSONL store → KNN search per chunk/model group → return top-k results with similarity scores.
+**Retrieve (`POST /retrieve`):**
+Natural language query → Gemini LLM generates SQL → Postgres returns matching `resume_id`s → load only those chunk positions from flat `nex_vec.npy` → dot product (= cosine similarity, vectors are unit-normalised) → dedup by `user_id` → return ranked candidates.
 
 ### Key Components
 
-| Layer                | Location                             | Purpose                                                                      |
-| -------------------- | ------------------------------------ | ---------------------------------------------------------------------------- |
-| API routes           | `app/routers/`                       | Thin HTTP handlers delegating to services                                    |
-| Ingestion pipeline   | `app/services/ingestion.py`          | Orchestrates extract → chunk → embed → store                                 |
-| Retrieval service    | `app/services/retrieval_service.py`  | Orchestrates embed → load → KNN search                                       |
-| Embedder             | `app/services/embedding/embedder.py` | Google Gemini via `langchain-google-genai`, batched in groups of 100         |
-| Chunking strategies  | `app/services/chunking/`             | `fixed_length`, `paragraph` (NLTK), or `both` — registered via `registry.py` |
-| Retrieval strategies | `app/services/retrieval/`            | KNN with cosine or dot-product distance — registered via `registry.py`       |
-| Vector store         | `app/services/store/jsonl_store.py`  | One JSONL file per knowledge base in `./vector_store/`                       |
-| Config               | `config.yaml` + `app/config.py`      | Chunk size, overlap, embedding model, KNN k, vector dimensions               |
+| Layer          | Location                                  | Purpose                                            |
+| -------------- | ----------------------------------------- | -------------------------------------------------- |
+| API routes     | `app/routers/`                            | Thin HTTP handlers delegating to services          |
+| Ingestion      | `app/services/ingestion.py`               | Orchestrates extract → parse → embed → store       |
+| Retrieval      | `app/services/retrieval_service.py`       | SQL-first filter → targeted vector search → rank   |
+| LLM parser     | `app/services/llm_parser.py`              | Gemini Flash: PDF text → 7-section structured JSON |
+| LLM query      | `app/services/llm_query.py`               | Gemini Flash: natural language → PostgreSQL SELECT |
+| Embedder       | `app/services/embedding/embedder.py`      | Google Gemini embeddings, batched                  |
+| Vector store   | `app/services/store/vector_file_store.py` | Flat `.npy` files in `./vector_store/`             |
+| Postgres store | `app/services/store/postgres_store.py`    | `users` + `resumes` tables on AWS RDS              |
+| Config         | `config.yaml` + `app/config.py`           | Embedding model, KNN k, vector dimensions          |
 
-### Design Patterns
+### Database Schema
 
-- **Registry pattern** for chunking and retrieval strategies — extend by adding a class and registering it.
-- **JSONL storage** (Phase 1 simplicity) — one file per knowledge base, each line is a JSON object with chunk text, embedding vector, and metadata.
-- Vectors are **L2-normalised** before storage so cosine similarity reduces to a dot product.
-- Retrieval groups chunks by `(chunking_strategy, embedding_model)` before running KNN.
+**`users`** — one row per unique person (identity: email + phone)
 
-### Configuration (`config.yaml`)
+- `user_id TEXT PK`, `name`, `email`, `phone`, `location`, `created_at`
 
-Key defaults: `chunk_size: 500`, `overlap_size: 50`, `default_chunking_strategy: both`, `embedding_model: models/gemini-embedding-001`, `output_dimensionality: 3072`, `vector_store_path: ./vector_store/`.
+**`resumes`** — one row per uploaded resume (a person can have multiple)
+
+- `resume_id TEXT PK`, `user_id FK`, `source_filename`, `file_hash UNIQUE`
+- 7 section columns: `objectives`, `work_experience_years NUMERIC`, `work_experience_text`, `projects`, `education`, `skills TEXT[]`, `achievements`
+- 6 chunk_id columns (one per embeddable section): `objectives_chunk_id`, `work_experience_text_chunk_id`, `projects_chunk_id`, `education_chunk_id`, `skills_chunk_id`, `achievements_chunk_id`
+- `embedding_model`, `is_active BOOLEAN`, `created_at`
+
+### Vector Store
+
+Single flat file: `vector_store/nex_vec.npy` (all vectors) + `nex_vec_ids.npy` (chunk_ids) + `nex_vec.jsonl` (audit log: chunk_id + resume_id + vector).
+
+All vectors are **unit-normalised** so dot product = cosine similarity.
+
+### Design Decisions
+
+- **SQL-first retrieval**: LLM generates SQL for structured filters (skills, experience, location) — only fall back to full scan on SQL exception, never on empty results.
+- **Person deduplication**: `email`/`phone` → reuse `user_id` across resume versions. One result per person in retrieval output.
+- **Content dedup**: SHA-256 hash — skip LLM + embedding if file already ingested.
+- **Soft deletes**: `is_active = FALSE` — `ON CONFLICT (file_hash) DO UPDATE` re-activates on re-ingest.
+- **GIN index on `skills TEXT[]`**: fast `@>` array containment queries.
 
 ## Testing
 
@@ -63,4 +85,4 @@ Tests live in `tests/` with fixtures in `conftest.py`. Tests mock the Google Gem
 
 ## Deployment
 
-CI/CD runs on push to `main` via `.github/workflows/deploy.yml` — SSH into AWS EC2, pull code, and restart with PM2. Never push directly to `main`.
+CI/CD runs on push to `main` via `.github/workflows/deploy.yml` — SSH into AWS EC2, pull code, restart with PM2. Never push directly to `main`.

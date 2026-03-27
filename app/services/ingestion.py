@@ -1,162 +1,210 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import uuid
 
 import numpy as np
 
 from app.config import get_config
-from app.models import IngestResponse, StrategyResult
-from app.services.chunking.registry import get_chunker_registry
+from app.models import IngestResponse, SectionResult
 from app.services.embedding.embedder import GeminiEmbedder
+from app.services.llm_parser import ParsedResume, parse_resume
 from app.services.pdf_extractor import extract_pdf_pages
 from app.services.store.postgres_store import PostgresStore
 from app.services.store.vector_file_store import VectorFileStore
-from app.utils import now_ist, now_ist_iso, slugify_name
+from app.utils import now_ist_iso
 
-
-SUPPORTED_CHUNKING_STRATEGIES = {"fixed_length", "paragraph", "both"}
 logger = logging.getLogger("nexvec.ingestion")
 
-
-def _normalise_vector(vector: list[float]) -> list[float]:
-    array = np.asarray(vector, dtype=float)
-    norm = np.linalg.norm(array)
-    if norm == 0:
-        return [0.0 for _ in vector]
-    return (array / norm).astype(float).tolist()
-
+# Fixed embeddable sections (work_experience_years is numeric — stored in DB, not embedded)
+EMBEDDABLE_SECTIONS = [
+    "objectives",
+    "work_experience_text",
+    "projects",
+    "education",
+    "skills",
+    "achievements",
+]
 
 UNIVERSAL_VECTOR_STORE = "nex_vec"
 
 
-def _resolve_kb_name(source_filename: str, provided_kb_name: str | None) -> str:
-    if provided_kb_name:
-        return slugify_name(provided_kb_name)
-    return UNIVERSAL_VECTOR_STORE
+def _hash_file(file_path: str) -> str:
+    """SHA-256 of file bytes — content-based identity, filename-independent."""
+    sha256 = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for block in iter(lambda: f.read(65536), b""):
+            sha256.update(block)
+    return sha256.hexdigest()
 
 
-def _chunk_page_text(chunker, page_number: int, text: str) -> list[tuple[int, str]]:
-    chunks = chunker.split(text)
-    return [(page_number, chunk) for chunk in chunks]
+def _normalise(arr: np.ndarray) -> np.ndarray:
+    norm = np.linalg.norm(arr)
+    return (arr / norm) if norm > 0 else arr
+
+
+def _section_text(parsed: ParsedResume, section: str) -> str | None:
+    """Return embeddable text for a section. Skills list is joined to a string."""
+    if section == "skills":
+        return ", ".join(parsed.skills) if parsed.skills else None
+    return getattr(parsed, section, None)
 
 
 def ingest_file(
     file_name: str,
     file_path: str,
-    kb_name: str | None,
-    chunking_strategy: str,
-    chunk_size: int | None,
-    overlap_size: int | None,
     embedding_model: str | None,
-    overwrite: bool,
 ) -> IngestResponse:
+    """
+    Ingest a PDF resume:
+
+      1. SHA-256 content hash — skip if already ingested
+      2. Extract text → LLM parses into 7 fixed sections + identity fields
+      3. Resolve or create user (email/phone identity)
+      4. Embed 6 sections (unit-normalised) → per-section .npy files
+      5. Persist resume row with section texts + chunk_ids to Postgres
+    """
     config = get_config()
     pg = PostgresStore()
     vfs = VectorFileStore()
-    pg.ensure_table()
-
-    resolved_kb_name = _resolve_kb_name(file_name, kb_name)
-    logger.info("Resolved kb_name=%s for source=%s", resolved_kb_name, file_name)
-
-    if chunking_strategy not in SUPPORTED_CHUNKING_STRATEGIES:
-        raise ValueError("Unsupported chunking strategy requested.")
-
-    strategy_names = ["fixed_length", "paragraph"] if chunking_strategy == "both" else [chunking_strategy]
     active_model = embedding_model or config.embedding_model
 
-    # Duplicate detection
-    active_duplicates_by_strategy = {
-        strategy: pg.has_active_chunks(file_name, strategy, active_model, resolved_kb_name)
-        for strategy in strategy_names
-    }
+    # ── Content-hash deduplication ────────────────────────────────────
+    file_hash = _hash_file(file_path)
+    existing_resume_id = pg.get_resume_id_by_hash(file_hash)
 
-    if not overwrite:
-        duplicate_hit = next((s for s, has_dup in active_duplicates_by_strategy.items() if has_dup), None)
-        if duplicate_hit:
-            logger.info(
-                "Duplicate ingestion rejected source=%s kb_name=%s strategy=%s model=%s",
-                file_name, resolved_kb_name, duplicate_hit, active_model,
-            )
-            raise FileExistsError(
-                f"Active chunks already exist for file={file_name}, strategy={duplicate_hit}, model={active_model}"
-            )
+    if existing_resume_id:
+        logger.info(
+            "Duplicate content (hash=%s...), returning existing resume_id=%s",
+            file_hash[:16], existing_resume_id,
+        )
+        resume = pg.get_resume_by_id(existing_resume_id)
+        r = resume or {}
+        sections_ingested = [
+            SectionResult(section_name=s, chunk_id=r[f"{s}_chunk_id"])
+            for s in EMBEDDABLE_SECTIONS
+            if r.get(f"{s}_chunk_id")
+        ]
+        return IngestResponse(
+            resume_id=existing_resume_id,
+            user_id=r.get("user_id", ""),
+            source_filename=r.get("source_filename", file_name),
+            sections_ingested=sections_ingested,
+            name=r.get("name"),
+            skills=list(r.get("skills") or []),
+            work_experience_years=r.get("work_experience_years"),
+            embedding_model=active_model,
+            ingested_at=r.get("created_at", now_ist_iso()),
+        )
 
-    if overwrite and any(active_duplicates_by_strategy.values()):
-        logger.info("Overwrite enabled; deactivating matching rows in kb_name=%s", resolved_kb_name)
-        deactivated_at = now_ist_iso()
-        deactivated_ids = pg.deactivate_chunks(file_name, strategy_names, active_model, resolved_kb_name, deactivated_at)
-        if deactivated_ids:
-            vfs.remove_chunk_ids(UNIVERSAL_VECTOR_STORE, set(deactivated_ids))
-            logger.info("Removed %s vectors from flat file for kb_name=%s", len(deactivated_ids), resolved_kb_name)
-
+    # ── Extract text ──────────────────────────────────────────────────
     pages = extract_pdf_pages(file_path)
     if not pages:
         raise LookupError("NO_EXTRACTABLE_TEXT")
-    logger.info("Extracted %s text pages from %s", len(pages), file_name)
+    full_text = "\n\n".join(p.text for p in pages if p.text.strip())
+    logger.info("Extracted %d pages (%d chars) from %s", len(pages), len(full_text), file_name)
 
-    effective_chunk_size = chunk_size or config.chunk_size
-    effective_overlap_size = overlap_size if overlap_size is not None else config.overlap_size
-    if effective_overlap_size >= effective_chunk_size:
-        raise ValueError("overlap_size must be smaller than chunk_size")
+    # ── LLM parse → 7 fixed sections + identity ───────────────────────
+    parsed = parse_resume(full_text)
 
-    chunkers = get_chunker_registry(effective_chunk_size, effective_overlap_size)
-    embedder = GeminiEmbedder(active_model)
+    # ── Resolve or create user (email/phone identity) ──────────────────
+    user_id = pg.get_user_id_by_contact(parsed.email, parsed.phone) or str(uuid.uuid4())
     created_at = now_ist_iso()
 
-    strategies_processed: list[StrategyResult] = []
-    for strategy_name in strategy_names:
-        logger.info("Starting chunking strategy=%s", strategy_name)
-        chunker = chunkers[strategy_name]
-        indexed_chunks: list[tuple[int, str]] = []
-        for page in pages:
-            indexed_chunks.extend(_chunk_page_text(chunker, page.page_number, page.text))
+    pg.upsert_user({
+        "user_id": user_id,
+        "name": parsed.name,
+        "email": parsed.email,
+        "phone": parsed.phone,
+        "location": parsed.location,
+        "created_at": created_at,
+    })
+    logger.info("User: user_id=%s (%s)", user_id,
+                "existing" if pg.get_user_id_by_contact(parsed.email, parsed.phone) else "new")
 
-        chunk_texts = [chunk_text for _, chunk_text in indexed_chunks]
-        logger.info("Generating embeddings strategy=%s chunk_count=%s model=%s", strategy_name, len(chunk_texts), embedder.model)
-        vectors = embedder.embed_texts(chunk_texts)
-        if len(vectors) != len(indexed_chunks):
-            raise RuntimeError("Embedding vector count does not match chunk count.")
+    # ── Embed 6 sections ──────────────────────────────────────────────
+    resume_id = str(uuid.uuid4())
+    embedder = GeminiEmbedder(active_model)
 
-        chunk_ids: list[str] = []
-        pg_rows: list[dict] = []
-        normalised_vectors: list[list[float]] = []
+    # Collect non-empty sections for batch embedding
+    to_embed = [
+        (section, _section_text(parsed, section))
+        for section in EMBEDDABLE_SECTIONS
+    ]
+    to_embed = [(s, t) for s, t in to_embed if t]
 
-        for index, ((page_number, chunk_text), vector) in enumerate(zip(indexed_chunks, vectors)):
+    chunk_ids: dict[str, str] = {}
+
+    if to_embed:
+        section_names_to_embed = [s for s, _ in to_embed]
+        texts_to_embed = [t for _, t in to_embed]
+        raw_vectors = embedder.embed_texts(texts_to_embed)
+
+        all_cids: list[str] = []
+        normed_matrix: list[np.ndarray] = []
+
+        for section, raw_vec in zip(section_names_to_embed, raw_vectors):
             cid = str(uuid.uuid4())
-            chunk_ids.append(cid)
-            normalised_vectors.append(_normalise_vector(vector))
-            pg_rows.append({
-                "chunk_id": cid,
-                "kb_name": resolved_kb_name,
-                "source_filename": file_name,
-                "chunking_strategy": strategy_name,
-                "chunk_index": index,
-                "page_number": page_number,
-                "chunk_text": chunk_text,
-                "embedding_model": embedder.model,
-                "is_active": True,
-                "created_at": created_at,
-                "deactivated_at": None,
-            })
+            chunk_ids[section] = cid
+            normed = _normalise(np.asarray(raw_vec, dtype=np.float32))
+            all_cids.append(cid)
+            normed_matrix.append(normed)
 
-        pg.insert_chunks(pg_rows)
-        vfs.append(UNIVERSAL_VECTOR_STORE, chunk_ids, np.array(normalised_vectors, dtype=np.float32))
-        logger.info("Stored %s chunks for strategy=%s kb_name=%s", len(chunk_ids), strategy_name, resolved_kb_name)
-
-        strategies_processed.append(
-            StrategyResult(
-                strategy_name=strategy_name,
-                chunk_count=len(chunk_ids),
-                embedding_model=embedder.model,
-                vector_size=config.vector_size,
-                overwritten=overwrite and bool(active_duplicates_by_strategy.get(strategy_name)),
-            )
+        # All section vectors for this resume appended to the single flat store
+        stacked = np.stack(normed_matrix).astype(np.float32)
+        vfs.append(
+            UNIVERSAL_VECTOR_STORE,
+            all_cids,
+            stacked,
+            text_records=[
+                {"chunk_id": cid, "resume_id": resume_id, "vector": vec.tolist()}
+                for cid, vec in zip(all_cids, stacked)
+            ],
         )
 
+    # ── Persist resume row ────────────────────────────────────────────
+    pg.insert_resume({
+        "resume_id": resume_id,
+        "user_id": user_id,
+        "source_filename": file_name,
+        "file_hash": file_hash,
+        "objectives": parsed.objectives,
+        "work_experience_years": parsed.work_experience_years,
+        "work_experience_text": parsed.work_experience_text,
+        "projects": parsed.projects,
+        "education": parsed.education,
+        "skills": parsed.skills or [],
+        "achievements": parsed.achievements,
+        "objectives_chunk_id": chunk_ids.get("objectives"),
+        "work_experience_text_chunk_id": chunk_ids.get("work_experience_text"),
+        "projects_chunk_id": chunk_ids.get("projects"),
+        "education_chunk_id": chunk_ids.get("education"),
+        "skills_chunk_id": chunk_ids.get("skills"),
+        "achievements_chunk_id": chunk_ids.get("achievements"),
+        "embedding_model": embedder.model,
+        "is_active": True,
+        "created_at": created_at,
+    })
+
+    logger.info(
+        "Ingested file=%s resume_id=%s user_id=%s sections_embedded=%d model=%s",
+        file_name, resume_id, user_id, len(chunk_ids), embedder.model,
+    )
+
+    sections_ingested = [
+        SectionResult(section_name=s, chunk_id=chunk_ids[s])
+        for s in EMBEDDABLE_SECTIONS
+        if s in chunk_ids
+    ]
     return IngestResponse(
-        kb_name=resolved_kb_name,
+        resume_id=resume_id,
+        user_id=user_id,
         source_filename=file_name,
-        strategies_processed=strategies_processed,
+        sections_ingested=sections_ingested,
+        name=parsed.name,
+        skills=parsed.skills,
+        work_experience_years=parsed.work_experience_years,
+        embedding_model=embedder.model,
         ingested_at=created_at,
     )

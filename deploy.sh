@@ -41,7 +41,7 @@ if pm2 describe $APP_NAME > /dev/null 2>&1; then
     pm2 reload $APP_NAME
 else
     echo "Starting $APP_NAME for the first time..."
-    pm2 start "venv/bin/uvicorn main:app --host 0.0.0.0 --port 8001" --name $APP_NAME
+    pm2 start "uv run uvicorn main:app --host 0.0.0.0 --port 8000" --name $APP_NAME
 fi
 
 # Save pm2 state
