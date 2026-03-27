@@ -1,0 +1,31 @@
+name: Deploy Prod
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to Production Server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PROD_EC2_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.PROD_SSH_PRIVATE_KEY }}
+          script: |
+            # If the script doesn't exist yet on the prod server, we might need a different initial step.
+            # Assuming deploy.sh is in the repo and the user manualy places it once or it's handled by git clone.
+            # Since deploy.sh is part of the repo, and we have the code, we'll assume it exists if cloned.
+            
+            if [ ! -d "~/alumnx-vector-db-prod" ]; then
+              mkdir -p ~/alumnx-vector-db-prod
+              git clone https://github.com/alumnx-ai-labs/alumnx-vector-db.git ~/alumnx-vector-db-prod
+            fi
+            cd ~/alumnx-vector-db-prod && bash deploy.sh main 9001 alumnx-vector-db-prod
